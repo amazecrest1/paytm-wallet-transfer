@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: wallet-transfer
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/wallet}
+    username: ${DATABASE_USER:wallet}
+    password: ${DATABASE_PASSWORD:wallet}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+
+server:
+  port: ${PORT:8080}
+
+wallet:
+  auth:
+    # Format: token1:userId1,token2:userId2
+    tokens: ${AUTH_TOKENS:dev-token-alice:alice,dev-token-bob:bob,dev-token-carol:carol,dev-token-dave:dave}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
+  endpoint:
+    health:
+      show-details: always
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+logging:
+  level:
+    root: INFO
+    com.paytm.wallet: INFO
