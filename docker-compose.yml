@@ -23,7 +23,7 @@ services:
       DATABASE_URL: jdbc:postgresql://db:5432/wallet
       DATABASE_USER: wallet
       DATABASE_PASSWORD: wallet
-      AUTH_TOKENS: dev-token-alice:alice,dev-token-bob:bob,dev-token-carol:carol,dev-token-dave:dave
+      AUTH_TOKENS: dev-token-alice:alice,dev-token-bob:bob,dev-token-carol:carol,dev-token-dave:dave,dev-token-erin:erin
     depends_on:
       db:
         condition: service_healthy

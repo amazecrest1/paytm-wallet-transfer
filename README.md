@@ -26,6 +26,7 @@ Default dev bearer tokens (see `AUTH_TOKENS` in `docker-compose.yml`):
 | `dev-token-bob` | bob |
 | `dev-token-carol` | carol |
 | `dev-token-dave` | dave |
+| `dev-token-erin` | erin |
 
 ## API
 
@@ -33,6 +34,11 @@ All endpoints require `Authorization: Bearer <token>`. Money is always integer p
 
 - `POST /wallets` — get-or-create a wallet for the caller.
 - `GET /wallets/{id}` — current balance.
+- `POST /wallets/{id}/deposit` — `{ "amount_paise", "idempotency_key" }`. **Beyond the exercise's
+  minimum API** — added because transfers alone can never bootstrap the system's first balance.
+  Injects money from outside the closed P2P loop (think: a linked bank account), so it's deliberately
+  exempt from the conservation invariant, which is scoped to transfers only (see DESIGN.md). `403` if
+  the caller doesn't own the wallet.
 - `POST /transfers` — `{ "from", "to", "amount_paise", "idempotency_key" }`. `403` if the caller
   doesn't own `from` (see DESIGN.md — a deliberate decision, not something the brief requires).
 - `GET /transfers/{id}` — transfer status.
@@ -66,19 +72,15 @@ implementation logic.
 ## Burst test
 
 ```bash
-./burst.sh                                                          # local docker-compose instance
-BASE_URL=https://your-app DATABASE_URL=postgresql://... ./burst.sh  # deployed instance
+./burst.sh                                    # local docker-compose instance
+BASE_URL=https://your-app ./burst.sh          # deployed instance
 ```
 
-Reproduces every gate from the brief against a *running* instance: 50 concurrent wallet creations,
-a 30-way idempotent retry storm, same-key/different-body conflict, a 90-way crossing-transfer
-conservation check, and single-pair overdraft contention. Requires `curl`, `jq`, `psql`.
-
-**Why it needs `DATABASE_URL`:** the API is peer-to-peer only — there's no deposit/mint endpoint (by
-design, per the brief), so a wallet can only ever move money that arrived via a prior transfer.
-Something has to seed the very first balance. The script does that with a single direct SQL `UPDATE`
-against `wallets.balance_paise` — never touching `transfers` — then verifies every invariant purely
-through the public HTTP API from that point on.
+Fully API-driven — no database access needed. Reproduces every gate from the brief against a
+*running* instance, funding wallets through the real deposit endpoint rather than reaching around the
+API: 50 concurrent wallet creations, a 30-way idempotent deposit storm, a 30-way idempotent transfer
+retry storm, same-key/different-body conflicts (both endpoints), a 90-way crossing-transfer
+conservation check, and single-pair overdraft contention. Requires only `curl`, `jq`, `xargs`.
 
 ## Deploy
 
@@ -91,10 +93,12 @@ variables (see `.env.example`). Flyway migrates the schema automatically on star
 - **Logs:** structured JSON (`logback-spring.xml` + logstash encoder) on stdout, with a
   `correlation_id` (from `X-Request-Id`, echoed back) and `user_id` in every line via MDC, plus
   domain events (`transfer_created`, `transfer_debited`, `transfer_credited`,
-  `transfer_declined_insufficient_funds`, `transfer_idempotent_replay`, `wallet_created`, ...) as
-  structured fields.
+  `transfer_declined_insufficient_funds`, `transfer_idempotent_replay`, `wallet_created`,
+  `deposit_completed`, `deposit_idempotent_replay`, ...) as structured fields.
 - **Metrics:** `/actuator/prometheus` — request rate/latency/error rate come from Spring Boot's
   built-in HTTP metrics; domain counters (`wallet_creations_total`, `transfers_completed_total`,
   `transfers_declined_total{reason="insufficient_funds"}`, `transfers_idempotent_replays_total`,
-  `transfers_idempotency_key_conflicts_total`) are custom (see `DomainMetrics`).
+  `transfers_idempotency_key_conflicts_total`, `deposits_completed_total`,
+  `deposits_idempotent_replays_total`, `deposits_idempotency_key_conflicts_total`) are custom (see
+  `DomainMetrics`).
 - **Health:** `/actuator/health`, used by the Docker `HEALTHCHECK`.

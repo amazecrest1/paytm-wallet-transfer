@@ -2,13 +2,9 @@
 #
 # One-command burst test reproducing every invariant/gate from the brief against a running instance.
 #
-# NOTE on seeding: the API is peer-to-peer only (POST /wallets always starts a wallet at 0, and the
-# only way a balance ever changes is via POST /transfers). There is deliberately no mint/deposit
-# endpoint — it isn't part of the spec. So the very first balance in the system has to come from
-# somewhere outside the API: this script seeds it with one direct SQL UPDATE against the wallets
-# table via $DATABASE_URL, then does EVERYTHING else — every invariant this script actually checks —
-# through the public HTTP API. That single seed statement is the only thing here that isn't an API
-# call, and it never touches the transfers table.
+# Fully API-driven — no direct database access needed. Wallets are funded through the real
+# POST /wallets/{id}/deposit endpoint (added beyond the exercise's minimum API specifically so this
+# script never has to reach around the API to seed a starting balance).
 #
 # Portability note: this deliberately avoids `xargs -I{}` for anything beyond a fixed one-line
 # command — BSD xargs (macOS) silently fails ("command line cannot be assembled") on the longer
@@ -17,17 +13,18 @@
 # which works identically on both.
 #
 # Usage:
-#   ./burst.sh                                    # against a local docker-compose instance
-#   BASE_URL=https://your-app.example.com \
-#   DATABASE_URL="postgresql://user:pass@host:5432/db" ./burst.sh   # against a deployed instance
+#   ./burst.sh                                          # against a local docker-compose instance
+#   BASE_URL=https://your-app.example.com ./burst.sh    # against a deployed instance
 #
 set -uo pipefail
 
 export BASE_URL="${BASE_URL:-http://localhost:8080}"
-export DATABASE_URL="${DATABASE_URL:-postgresql://wallet:wallet@localhost:5432/wallet}"
 export TOKEN_A="${TOKEN_A:-dev-token-alice}"
 export TOKEN_B="${TOKEN_B:-dev-token-bob}"
 export TOKEN_C="${TOKEN_C:-dev-token-carol}"
+# Used only by Gate 4b, deliberately disjoint from every wallet Gates 1-4 touch — see that section.
+export TOKEN_D="${TOKEN_D:-dev-token-dave}"
+export TOKEN_E="${TOKEN_E:-dev-token-erin}"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -37,7 +34,7 @@ fail=0
 ok()  { printf '  OK   - %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  FAIL - %s\n' "$1"; fail=$((fail + 1)); }
 
-for dep in curl jq psql xargs; do
+for dep in curl jq xargs; do
   command -v "$dep" >/dev/null 2>&1 || { echo "missing dependency: $dep" >&2; exit 1; }
 done
 
@@ -49,9 +46,16 @@ balance_of() {
   curl -s "$BASE_URL/wallets/$1" -H "Authorization: Bearer $2" | jq -r .balance_paise
 }
 
-seed_balance() {
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
-    -c "UPDATE wallets SET balance_paise = $2 WHERE id = '$1'" >/dev/null
+deposit_status() {
+  # deposit_status <token> <wallet_id> <amount_paise> <idempotency_key> <out_body_file>
+  curl -s -o "$5" -w '%{http_code}' -X POST "$BASE_URL/wallets/$2/deposit" \
+    -H "Authorization: Bearer $1" -H 'Content-Type: application/json' \
+    -d "{\"amount_paise\":$3,\"idempotency_key\":\"$4\"}"
+}
+
+fund() {
+  # fund <token> <wallet_id> <amount_paise> — one-shot deposit, used purely for test setup below.
+  deposit_status "$1" "$2" "$3" "fund-$2-$3" "$TMP_DIR/fund.body" >/dev/null
 }
 
 post_transfer_status() {
@@ -76,26 +80,55 @@ else
 fi
 
 echo
-echo "== Setup: two funded wallets for the transfer gates =="
+echo "== Gate 2: 30 concurrent identical deposits (same idempotency key) -> exactly one credit =="
+# This funds wallet A for the transfer gates below AND proves deposit idempotency in the same step —
+# deliberately not a separate throwaway wallet: get-or-create is idempotent per user, so a second
+# "fresh" wallet for token A would actually be the SAME wallet Setup funds next, and an additive
+# deposit on top of that would silently break the hard-coded balance math further down.
 WALLET_A=$(create_wallet "$TOKEN_A")
 WALLET_B=$(create_wallet "$TOKEN_B")
-seed_balance "$WALLET_A" 1000000
-echo "  wallet A=$WALLET_A funded to 1,000,000 paise; wallet B=$WALLET_B starts at 0"
 export WALLET_A WALLET_B
-
-echo
-echo "== Gate 2: 30 concurrent identical transfers (same idempotency key) -> exactly one movement =="
 GATE2_DIR="$TMP_DIR/gate2"; mkdir -p "$GATE2_DIR"
 export GATE2_DIR
 seq 1 30 | xargs -P30 -n1 bash -c '
   i="$1"
-  status=$(curl -s -o "$GATE2_DIR/$i.body" -w "%{http_code}" -X POST "$BASE_URL/transfers" \
+  status=$(curl -s -o "$GATE2_DIR/$i.body" -w "%{http_code}" -X POST "$BASE_URL/wallets/$WALLET_A/deposit" \
     -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
-    -d "{\"from\":\"$WALLET_A\",\"to\":\"$WALLET_B\",\"amount_paise\":5000,\"idempotency_key\":\"storm-key\"}")
+    -d "{\"amount_paise\":1000000,\"idempotency_key\":\"fund-a-key\"}")
   echo "$status" > "$GATE2_DIR/$i.status"
 ' _
-distinct_transfer_ids=$(for f in "$GATE2_DIR"/*.body; do jq -r .transfer_id "$f" 2>/dev/null; done | sort -u | grep -c . || true)
-distinct_statuses=$(cat "$GATE2_DIR"/*.status | sort -u | grep -c . || true)
+distinct_deposit_ids=$(for f in "$GATE2_DIR"/*.body; do jq -r .deposit_id "$f" 2>/dev/null; done | sort -u | grep -c . || true)
+balance_after_deposit_storm=$(balance_of "$WALLET_A" "$TOKEN_A")
+echo "  wallet A=$WALLET_A funded to $balance_after_deposit_storm paise; wallet B=$WALLET_B starts at 0"
+if [ "$distinct_deposit_ids" = "1" ] && [ "$balance_after_deposit_storm" = "1000000" ]; then
+  ok "30 concurrent identical deposits -> 1 deposit id, exactly one 1,000,000-paise credit"
+else
+  bad "30 concurrent identical deposits -> $distinct_deposit_ids deposit id(s), balance=$balance_after_deposit_storm (expected 1000000)"
+fi
+
+echo
+echo "== Gate 2b: same deposit idempotency key + different amount -> 409 =="
+status2=$(deposit_status "$TOKEN_A" "$WALLET_A" 9999 "fund-a-key" "$TMP_DIR/dep-conflict.body")
+balance_after_conflict=$(balance_of "$WALLET_A" "$TOKEN_A")
+if [ "$status2" = "409" ] && [ "$balance_after_conflict" = "1000000" ]; then
+  ok "same deposit key + different amount -> 409, balance still 1,000,000"
+else
+  bad "same deposit key + different amount -> $status2 (expected 409), balance=$balance_after_conflict (expected 1000000)"
+fi
+
+echo
+echo "== Gate 3: 30 concurrent identical transfers (same idempotency key) -> exactly one movement =="
+GATE3_DIR="$TMP_DIR/gate3"; mkdir -p "$GATE3_DIR"
+export GATE3_DIR
+seq 1 30 | xargs -P30 -n1 bash -c '
+  i="$1"
+  status=$(curl -s -o "$GATE3_DIR/$i.body" -w "%{http_code}" -X POST "$BASE_URL/transfers" \
+    -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+    -d "{\"from\":\"$WALLET_A\",\"to\":\"$WALLET_B\",\"amount_paise\":5000,\"idempotency_key\":\"storm-key\"}")
+  echo "$status" > "$GATE3_DIR/$i.status"
+' _
+distinct_transfer_ids=$(for f in "$GATE3_DIR"/*.body; do jq -r .transfer_id "$f" 2>/dev/null; done | sort -u | grep -c . || true)
+distinct_statuses=$(cat "$GATE3_DIR"/*.status | sort -u | grep -c . || true)
 balance_a_after_storm=$(balance_of "$WALLET_A" "$TOKEN_A")
 if [ "$distinct_transfer_ids" = "1" ] && [ "$distinct_statuses" = "1" ] && [ "$balance_a_after_storm" = "995000" ]; then
   ok "30 concurrent identical transfers -> 1 transfer id, 1 status code, exactly one 5000-paise debit"
@@ -104,25 +137,25 @@ else
 fi
 
 echo
-echo "== Gate 2b: same idempotency key + different body -> 409 =="
+echo "== Gate 3b: same transfer idempotency key + different body -> 409 =="
 post_transfer_status "$TOKEN_A" "$WALLET_A" "$WALLET_B" 1000 "conflict-key" "$TMP_DIR/c1.body" > /dev/null
-status2=$(post_transfer_status "$TOKEN_A" "$WALLET_A" "$WALLET_B" 2000 "conflict-key" "$TMP_DIR/c2.body")
-if [ "$status2" = "409" ]; then
-  ok "same key + different body -> 409"
+status3b=$(post_transfer_status "$TOKEN_A" "$WALLET_A" "$WALLET_B" 2000 "conflict-key" "$TMP_DIR/c2.body")
+if [ "$status3b" = "409" ]; then
+  ok "same transfer key + different body -> 409"
 else
-  bad "same key + different body -> $status2 (expected 409)"
+  bad "same transfer key + different body -> $status3b (expected 409)"
 fi
 
 echo
-echo "== Gate 3: conservation + no-overdraft under concurrent contention (incl. A->B and B->A) =="
+echo "== Gate 4: conservation + no-overdraft under concurrent contention (incl. A->B and B->A) =="
 WALLET_C=$(create_wallet "$TOKEN_C")
-seed_balance "$WALLET_B" 50000
-seed_balance "$WALLET_C" 50000
+fund "$TOKEN_B" "$WALLET_B" 50000
+fund "$TOKEN_C" "$WALLET_C" 50000
 export WALLET_C
 total_before=$(( $(balance_of "$WALLET_A" "$TOKEN_A") + $(balance_of "$WALLET_B" "$TOKEN_B") + $(balance_of "$WALLET_C" "$TOKEN_C") ))
 
-GATE3_DIR="$TMP_DIR/gate3"; mkdir -p "$GATE3_DIR"
-export GATE3_DIR
+GATE4_DIR="$TMP_DIR/gate4"; mkdir -p "$GATE4_DIR"
+export GATE4_DIR
 seq 1 90 | xargs -P30 -n1 bash -c '
   i="$1"
   case $(( i % 4 )) in
@@ -132,12 +165,12 @@ seq 1 90 | xargs -P30 -n1 bash -c '
     3) FROM="$WALLET_C"; TO="$WALLET_B"; TOKEN="$TOKEN_C" ;;
   esac
   amount=$(( 500 + (i % 7) * 137 ))
-  status=$(curl -s -o "$GATE3_DIR/$i.body" -w "%{http_code}" -X POST "$BASE_URL/transfers" \
+  status=$(curl -s -o "$GATE4_DIR/$i.body" -w "%{http_code}" -X POST "$BASE_URL/transfers" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d "{\"from\":\"$FROM\",\"to\":\"$TO\",\"amount_paise\":$amount,\"idempotency_key\":\"gate3-$i\"}")
-  echo "$status" > "$GATE3_DIR/$i.status"
+    -d "{\"from\":\"$FROM\",\"to\":\"$TO\",\"amount_paise\":$amount,\"idempotency_key\":\"gate4-$i\"}")
+  echo "$status" > "$GATE4_DIR/$i.status"
 ' _
-server_errors=$(cat "$GATE3_DIR"/*.status 2>/dev/null | grep -c '^5' || true)
+server_errors=$(cat "$GATE4_DIR"/*.status 2>/dev/null | grep -c '^5' || true)
 
 total_after=$(( $(balance_of "$WALLET_A" "$TOKEN_A") + $(balance_of "$WALLET_B" "$TOKEN_B") + $(balance_of "$WALLET_C" "$TOKEN_C") ))
 bal_a=$(balance_of "$WALLET_A" "$TOKEN_A"); bal_b=$(balance_of "$WALLET_B" "$TOKEN_B"); bal_c=$(balance_of "$WALLET_C" "$TOKEN_C")
@@ -151,25 +184,30 @@ else
 fi
 
 echo
-echo "== Gate 3b: insufficient-funds contention never overdraws =="
-WALLET_D=$(create_wallet "$TOKEN_A")
-WALLET_E=$(create_wallet "$TOKEN_B")
-seed_balance "$WALLET_D" 10000
+echo "== Gate 4b: insufficient-funds contention never overdraws =="
+# Uses TOKEN_D/TOKEN_E exclusively — NOT the A/B/C tokens Gates 1-4 already used. Wallet creation is
+# idempotent per user, so reusing an earlier gate's token here would silently hand back that SAME
+# wallet (not a fresh one) and this gate's fund() would add to whatever balance the earlier gate left
+# behind — confusing to anyone inspecting the wallet afterward, even though each gate's own assertions
+# still run correctly in sequence. Keeping every gate's wallets disjoint avoids that.
+WALLET_D=$(create_wallet "$TOKEN_D")
+WALLET_E=$(create_wallet "$TOKEN_E")
+fund "$TOKEN_D" "$WALLET_D" 10000
 export WALLET_D WALLET_E
 
-GATE3B_DIR="$TMP_DIR/gate3b"; mkdir -p "$GATE3B_DIR"
-export GATE3B_DIR
+GATE4B_DIR="$TMP_DIR/gate4b"; mkdir -p "$GATE4B_DIR"
+export GATE4B_DIR
 seq 1 24 | xargs -P24 -n1 bash -c '
   i="$1"
-  status=$(curl -s -o "$GATE3B_DIR/$i.body" -w "%{http_code}" -X POST "$BASE_URL/transfers" \
-    -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  status=$(curl -s -o "$GATE4B_DIR/$i.body" -w "%{http_code}" -X POST "$BASE_URL/transfers" \
+    -H "Authorization: Bearer $TOKEN_D" -H "Content-Type: application/json" \
     -d "{\"from\":\"$WALLET_D\",\"to\":\"$WALLET_E\",\"amount_paise\":1000,\"idempotency_key\":\"od-$i\"}")
-  echo "$status" > "$GATE3B_DIR/$i.status"
+  echo "$status" > "$GATE4B_DIR/$i.status"
 ' _
-succeeded=$(cat "$GATE3B_DIR"/*.status | grep -c '^201' || true)
-server_errors=$(cat "$GATE3B_DIR"/*.status | grep -c '^5' || true)
+succeeded=$(cat "$GATE4B_DIR"/*.status | grep -c '^201' || true)
+server_errors=$(cat "$GATE4B_DIR"/*.status | grep -c '^5' || true)
 
-bal_d=$(balance_of "$WALLET_D" "$TOKEN_A")
+bal_d=$(balance_of "$WALLET_D" "$TOKEN_D")
 if [ "$server_errors" = "0" ] && [ "$succeeded" = "10" ] && [ "$bal_d" = "0" ]; then
   ok "exactly 10/24 concurrent 1000-paise debits succeeded against a 10000 balance; drained to exactly 0"
 else

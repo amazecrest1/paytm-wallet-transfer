@@ -22,7 +22,10 @@ public class DomainMetrics {
     private final Counter transfersCreated;
     private final Counter transfersDeclinedInsufficientFunds;
     private final Counter transfersIdempotentReplays;
-    private final Counter idempotencyKeyConflicts;
+    private final Counter transfersIdempotencyKeyConflicts;
+    private final Counter depositsCompleted;
+    private final Counter depositsIdempotentReplays;
+    private final Counter depositsIdempotencyKeyConflicts;
 
     public DomainMetrics(MeterRegistry registry) {
         this.walletsCreated = Counter.builder("wallet_creations_total")
@@ -38,7 +41,16 @@ public class DomainMetrics {
         this.transfersIdempotentReplays = Counter.builder("transfers_idempotent_replays_total")
                 .description("Requests served from an existing transfer via idempotency key")
                 .register(registry);
-        this.idempotencyKeyConflicts = Counter.builder("transfers_idempotency_key_conflicts_total")
+        this.transfersIdempotencyKeyConflicts = Counter.builder("transfers_idempotency_key_conflicts_total")
+                .description("Same idempotency key reused with a different request body (409)")
+                .register(registry);
+        this.depositsCompleted = Counter.builder("deposits_completed_total")
+                .description("Deposits that completed successfully")
+                .register(registry);
+        this.depositsIdempotentReplays = Counter.builder("deposits_idempotent_replays_total")
+                .description("Requests served from an existing deposit via idempotency key")
+                .register(registry);
+        this.depositsIdempotencyKeyConflicts = Counter.builder("deposits_idempotency_key_conflicts_total")
                 .description("Same idempotency key reused with a different request body (409)")
                 .register(registry);
     }
@@ -59,7 +71,19 @@ public class DomainMetrics {
         transfersIdempotentReplays.increment();
     }
 
-    public void idempotencyKeyConflict() {
-        idempotencyKeyConflicts.increment();
+    public void transferIdempotencyKeyConflict() {
+        transfersIdempotencyKeyConflicts.increment();
+    }
+
+    public void depositCompleted() {
+        depositsCompleted.increment();
+    }
+
+    public void depositIdempotentReplay() {
+        depositsIdempotentReplays.increment();
+    }
+
+    public void depositIdempotencyKeyConflict() {
+        depositsIdempotencyKeyConflicts.increment();
     }
 }

@@ -96,7 +96,16 @@ public class WalletRepository {
         return List.of(firstWallet, secondWallet);
     }
 
-    private Wallet lockSingle(UUID walletId) {
+    /**
+     * Locks one wallet row. {@link #lockPairOrdered} uses this twice, in order, for a transfer's two
+     * wallets; a single-wallet operation like deposit uses it directly — the same FK-implied-lock
+     * hazard applies even with one wallet (many concurrent deposits to the same wallet each take an
+     * implicit FOR KEY SHARE via the deposits FK the instant their row is inserted; if that insert
+     * happened before this lock, they'd all need to mutually upgrade past each other's shared lock,
+     * the identical N-way deadlock pattern found for transfers) — so this must still run before the
+     * deposit row is inserted, exactly as it does for transfers.
+     */
+    public Wallet lockSingle(UUID walletId) {
         String sql = """
                 SELECT id, user_id, balance_paise, created_at, updated_at
                 FROM wallets

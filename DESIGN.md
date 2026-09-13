@@ -2,13 +2,17 @@
 
 ## Data model
 
-Two tables. `wallets(id, user_id UNIQUE, balance_paise BIGINT CHECK >= 0, timestamps)`.
+Three tables. `wallets(id, user_id UNIQUE, balance_paise BIGINT CHECK >= 0, timestamps)`.
 `transfers(id, initiator_user_id, from_wallet_id FK, to_wallet_id FK, amount_paise BIGINT CHECK > 0,
 idempotency_key, request_hash, status, decline_reason, timestamps, UNIQUE(initiator_user_id,
-idempotency_key), CHECK(from_wallet_id <> to_wallet_id))`. No separate ledger/double-entry table —
-`transfers` is the audit trail; a full ledger was considered and deliberately deferred as scope the
-exercise doesn't grade. Money is `BIGINT` paise everywhere: storage, Java (`long`), and the JSON wire
-format (`amount_paise` is always an integer paise value, never a decimal rupee amount).
+idempotency_key), CHECK(from_wallet_id <> to_wallet_id))`. `deposits(id, user_id, wallet_id FK,
+amount_paise BIGINT CHECK > 0, idempotency_key, request_hash, timestamps, UNIQUE(user_id,
+idempotency_key))` — no status column, unlike transfers: a deposit has no failure mode besides
+validation/idempotency-conflict, so every row that exists represents one that already succeeded. No
+separate ledger/double-entry table — `transfers`/`deposits` are the audit trail; a full ledger was
+considered and deliberately deferred as scope the exercise doesn't grade. Money is `BIGINT` paise
+everywhere: storage, Java (`long`), and the JSON wire format (`amount_paise` is always an integer
+paise value, never a decimal rupee amount).
 
 ## The simplest-correct mechanism
 
@@ -107,6 +111,42 @@ new auth infrastructure, so it doesn't reintroduce the "auth sophistication" the
 `to` is deliberately left unconstrained — receiving funds doesn't need the recipient's consent in any
 real payment system either.
 
+## The deposit endpoint — added beyond the minimum API
+
+`POST /wallets/{id}/deposit` isn't in the brief's minimum API. It was added because the brief's
+peer-to-peer-only design has a real bootstrapping gap: `POST /wallets` always starts a wallet at 0,
+and the only other way a balance ever changes is `POST /transfers` — meaning nothing can ever fund the
+*first* wallet in the system without reaching outside the API entirely (the burst script originally
+did exactly that, with a direct SQL `UPDATE`). A deposit is the standard answer: money entering from
+outside the closed P2P loop, exactly like a real wallet's linked-bank-account top-up.
+
+**Conservation is deliberately scoped to transfers, not the whole system.** The brief's invariant is
+"the sum of all wallet balances never changes *across a transfer*" — a deposit is a different
+operation by definition, injecting new money, so it is the explicit, audited exception to that
+invariant rather than a violation of it. The burst script's own conservation check (Gate 4) sums
+balances only across a transfer-only burst, for exactly this reason.
+
+**Same mechanism, same authorization symmetry, same lock-order fix.** A deposit reuses the identical
+idempotency pattern (unique `(user_id, idempotency_key)`, inserted as the transaction's first
+statement) and the identical `WalletRepository.credit` used by transfers. It also reuses the ownership
+check from §Source-wallet authorization, applied symmetrically: a caller may only deposit into a
+wallet they own, for the same reason they may only debit one they own — money enters or leaves a
+wallet only at its owner's initiative. And it reuses the FK-lock fix from the section above, because
+the identical hazard exists for a *single* wallet under concurrent deposits: many concurrent inserts
+into `deposits` (whose FK references `wallets(id)`) each take a compatible `FOR KEY SHARE` on that one
+wallet row, and all of them upgrading to `FOR UPDATE` afterward is the same N-way deadlock pattern,
+just with one wallet instead of two. The fix is identical too: lock the wallet (`WalletRepository`'s
+existing single-row `lockSingle`, now exposed rather than private) *before* inserting the deposit row.
+Proven live under a 30-way identical-key concurrent deposit burst, same as transfers were.
+
+**What deposit does *not* get:** the retry-wrapper split (`TransferService`/`TransferExecutor`) that
+absorbs Postgres's rare high-fan-out deadlock-detector artifact for transfers. The root-cause fix
+(lock-before-insert) is applied here exactly as it is for transfers, so no deadlock should occur under
+any normal load; the residual risk the retry wrapper defends against for transfers is realistically
+much lower here (many-way concurrent deposits into the exact same wallet is not a scenario this
+exercise's burst tests exercise), and adding the two-class split for a single-row operation would be
+complexity out of proportion to that risk.
+
 ## Consistency vs. availability
 
 Chose strong consistency — single-node Postgres, row-level locks, no async replication in the write
@@ -128,6 +168,12 @@ decision to defer a full ledger table and the reversal endpoint.
 backoff curve) — tuned empirically against real contention rather than picked a priori. The FK/lock
 ordering bug in the section above was *found* by AI-run adversarial concurrency tests, and the fix
 was reasoned out and verified the same way, live against real Postgres, not asserted from theory.
+
+**Directed, again:** adding the deposit endpoint at all (I asked for it, having hit the bootstrapping
+gap firsthand while seeding burst tests via raw SQL) — the AI proposed the design (no status column,
+conservation-scope carve-out, reusing the ownership check and the FK-lock fix rather than inventing
+new mechanisms) and I verified the reuse was actually sound rather than assuming it, including running
+the same class of concurrency burst against it that had found the original transfer bug.
 
 **Caught by my own review, not the AI's:** the movement-order bug described above — the AI's first
 design draft tied debit/credit order to id order, which I read closely enough to catch would violate

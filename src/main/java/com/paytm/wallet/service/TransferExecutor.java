@@ -125,7 +125,7 @@ class TransferExecutor {
         if (!existing.requestHash().equals(requestHash)) {
             log.info("idempotency_key_conflict", kv("event", "idempotency_key_conflict"),
                     kv("idempotency_key", idempotencyKey), kv("initiator_user_id", initiatorUserId));
-            metrics.idempotencyKeyConflict();
+            metrics.transferIdempotencyKeyConflict();
             throw new IdempotencyConflictException(idempotencyKey);
         }
 

@@ -39,48 +39,7 @@ class TransferConcurrencyTest extends AbstractIntegrationTest {
                 new HttpEntity<>(body, authHeaders(token)), Map.class);
     }
 
-    /**
-     * Runs {@code tasks} concurrently through a start-gate so they fire as close to simultaneously as
-     * possible, and returns their results in submission order once all have completed.
-     */
-    private <T> List<T> runConcurrently(List<Callable<T>> tasks, long timeoutSeconds) throws InterruptedException {
-        ExecutorService pool = Executors.newFixedThreadPool(Math.min(tasks.size(), 60));
-        CountDownLatch startGate = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(tasks.size());
-        List<Future<T>> futures = new ArrayList<>();
-        try {
-            for (Callable<T> task : tasks) {
-                futures.add(pool.submit(() -> {
-                    startGate.await();
-                    try {
-                        return task.call();
-                    } finally {
-                        doneLatch.countDown();
-                    }
-                }));
-            }
-            startGate.countDown();
-            boolean finished = doneLatch.await(timeoutSeconds, TimeUnit.SECONDS);
-            assertThat(finished).as("all tasks completed within timeout").isTrue();
-            List<T> results = new ArrayList<>();
-            for (Future<T> f : futures) {
-                try {
-                    results.add(f.get());
-                } catch (ExecutionException e) {
-                    throw new RuntimeException(e.getCause());
-                }
-            }
-            return results;
-        } finally {
-            // shutdownNow() (not shutdown()) is load-bearing: if the timeout above is ever hit, some
-            // tasks are still blocked holding a DB connection/row lock. A graceful shutdown() would
-            // let them keep running in the background, leaking a held lock into the next test's
-            // @BeforeEach TRUNCATE and deadlocking IT too. Interrupting here guarantees this test's
-            // DB state is fully quiesced before the next test starts.
-            pool.shutdownNow();
-            pool.awaitTermination(10, TimeUnit.SECONDS);
-        }
-    }
+    // runConcurrently(...) now lives in AbstractIntegrationTest — shared with DepositConcurrencyTest.
 
     @Test
     void thirtyConcurrentIdenticalTransfersProduceExactlyOneMovement() throws InterruptedException {

@@ -19,7 +19,7 @@ server:
 wallet:
   auth:
     # Format: token1:userId1,token2:userId2
-    tokens: ${AUTH_TOKENS:dev-token-alice:alice,dev-token-bob:bob,dev-token-carol:carol,dev-token-dave:dave}
+    tokens: ${AUTH_TOKENS:dev-token-alice:alice,dev-token-bob:bob,dev-token-carol:carol,dev-token-dave:dave,dev-token-erin:erin}
 
 management:
   endpoints:
